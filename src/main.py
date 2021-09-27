@@ -27,11 +27,98 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(self.title)
         self.setGeometry(self.left, self.top, self.width, self.height)
         #
-        # self.tab_widget = TabWidget(self)
+        self.tabWidget = TabWidget(self)
+
+        self.setCentralWidget(self.tabWidget)
+        self.show()
+
+
+    # Creating tab widgets
+
+class CustomTabBar(QTabBar):
+    def __init__(self,parent=True):
+        super(CustomTabBar, self).__init__(parent=parent)
+        # self.setExpanding(True)
+
+    def tabSizeHint(self, index:int):
+        size = super(CustomTabBar, self).tabSizeHint(index)
+        w = self.parent().width()/2
+        size.setWidth(w)
+        return size
+
+class TabWidget(QWidget):
+    def __init__(self, parent):
+        super(TabWidget, self).__init__(parent)
+        self.setupUi()
+
+    def resizeEvent(self, event):
+        super(TabWidget, self).resizeEvent(event)
+        size = self.tabs.tabBar().size()
+        size.setWidth(self.size().width())
+        self.tabs.tabBar().resize(size)
+        # self.tabs.tabBar().resizeEvent(event)
+        # self.tabs.tabBar().setUsesScrollButtons(False)
+        # print('sdsd')
+
+    def setupUi(self):
+        self.layout = QVBoxLayout(self)
+
+        # Initialize tab screen
+        self.tabs = QTabWidget()
+        self.tab1 = QWidget()
+        self.tab2 = QWidget()
+        self.tabs.resize(792, 610)
+        self.tabBar = CustomTabBar(self)
+        self.tabs.setTabBar(self.tabBar)
+        # Add tabs
+        self.tabs.addTab(self.tab1, "Project-Library Tracking")
+        self.tabs.addTab(self.tab2, "Misc. Utilities")
+
+        # Create first tab
+        self.tab1Layout = QVBoxLayout(self)
+        # self.excelWidget = ExcelCompare()
+        self.topLayout = QHBoxLayout(self)
+        self.instructionLabel = QLabel('Select Project & Library to get started')
+        self.topLayout.addWidget(self.instructionLabel)
+        self.projectDropDown = QComboBox()
+        self.projectDropDown.addItems(['Project 1','Project 2','Project 3'])
+        self.topLayout.addWidget(self.projectDropDown)
+        self.projectLabel = QLabel('Project')
+        self.topLayout.addWidget(self.projectLabel)
+        self.libraryDropDown = QComboBox()
+        self.libraryDropDown.addItems(['library 1', 'library 2', 'library 3'])
+        self.topLayout.addWidget(self.libraryDropDown)
+        self.libraryLabel = QLabel('Library')
+        self.topLayout.addWidget(self.libraryLabel)
+        self.topLayout.addStretch()
+
+        self.topButtonLayout = QHBoxLayout(self)
+        self.itemsButton = QPushButton('Items')
+        self.topButtonLayout.addWidget(self.itemsButton)
+        self.tasksButton = QPushButton('Tasks')
+        self.topButtonLayout.addWidget(self.tasksButton)
+        self.issuesButton = QPushButton('Issues')
+        self.topButtonLayout.addWidget(self.issuesButton)
+        self.topLayout.addLayout(self.topButtonLayout)
+
+        self.itemsButton.clicked.connect(self.buttonClicked)
+
+        self.tab1Layout.addLayout(self.topLayout)
+        self.tableView = QTableView()
+        self.tableView.resize(300,300)
+        self.tab1Layout.addWidget(self.tableView)
+
+        self.tab1.setLayout(self.tab1Layout)
+
+        # Create second tab
+        # self.tab2Layout = QVBoxLayout(self)
+        # self.sasWidget = SpecsSAS()
+        # self.tab2Layout.addWidget(self.sasWidget)
+        # self.tab2.setLayout(self.tab2Layout)
         self.centralWidget = QWidget(self)
-        self.mainLayout = QHBoxLayout()
+        self.tab2Layout = QHBoxLayout(self)
         self.utilityListView = QListView(self)
-        self.listModel = ListModel(['Excel Compare',])
+        self.listModel = ListModel(['Excel Compare', ])
         self.utilityListView.setModel(self.listModel)
         self.utilityListView.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.utilityListView.setMaximumWidth(200)
@@ -45,12 +132,17 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.utilityListView)
         splitter.addWidget(self.rightWidget)
         splitter.setChildrenCollapsible(False)
-        self.mainLayout.addWidget(splitter)
-        self.placeHolderWidget = QLabel("Select a utility from the list",parent=self.rightWidget)
-        self.rightlayout.addWidget(self.placeHolderWidget,alignment=Qt.AlignCenter)
-        self.centralWidget.setLayout(self.mainLayout)
-        self.setCentralWidget(self.centralWidget)
-        self.show()
+        self.tab2Layout.addWidget(splitter)
+        self.placeHolderWidget = QLabel("Select a utility from the list", parent=self.rightWidget)
+        self.rightlayout.addWidget(self.placeHolderWidget, alignment=Qt.AlignCenter)
+        self.tab2.setLayout(self.tab2Layout)
+
+        # Add tabs to widget
+        self.layout.addWidget(self.tabs)
+        self.setLayout(self.layout)
+
+    def buttonClicked(self):
+        print('here')
 
     def stepSelected(self):
         if len(self.utilityListView.selectedIndexes()) < 1: return
@@ -58,46 +150,10 @@ class MainWindow(QMainWindow):
 
         for i in range(self.rightlayout.count()):
             self.rightlayout.itemAt(i).widget().hide()
+
         if step == 'Excel Compare':
             self.excelComapre =  ExcelCompare(self)
             self.rightlayout.addWidget(self.excelComapre)
-    # Creating tab widgets
-
-
-class TabWiget(QWidget):
-    def __init__(self, parent):
-        super(TabWidget, self).__init__(parent)
-        self.setupUi()
-
-    def setupUi(self):
-        self.layout = QVBoxLayout(self)
-
-        # Initialize tab screen
-        self.tabs = QTabWidget()
-        self.tab1 = QWidget()
-        self.tab2 = QWidget()
-        self.tabs.resize(792, 610)
-
-        # Add tabs
-        self.tabs.addTab(self.tab1, "Excel Compare")
-        self.tabs.addTab(self.tab2, "Specs vs SAS")
-
-        # Create first tab
-        self.tab1Layout = QVBoxLayout(self)
-        self.excelWidget = ExcelCompare()
-        self.tab1Layout.addWidget(self.excelWidget)
-        self.tab1.setLayout(self.tab1Layout)
-
-        # Create second tab
-        self.tab2Layout = QVBoxLayout(self)
-        self.sasWidget = SpecsSAS()
-        self.tab2Layout.addWidget(self.sasWidget)
-        self.tab2.setLayout(self.tab2Layout)
-
-        # Add tabs to widget
-        self.layout.addWidget(self.tabs)
-        self.setLayout(self.layout)
-
 
 class ListModel(QAbstractListModel):
     def __init__(self,data=[]):
