@@ -1,54 +1,1543 @@
+import re
+import mysql.connector
+from _collections import deque
 from PySide2.QtWidgets import *
 from PySide2.QtCore import *
 from PySide2.QtGui import  *
 import sys
 import os
+import json
 import numpy as np
 import pandas as pd
 from datetime import  datetime
-import itertools
+import time
 import pyreadstat
 import xlsxwriter
+import src.settings as s
+from src.delegates.commentDelegate import CommentWidget
+from src.model.ListModel import ListModel
+from src.model.TableModel import BaseTableModel
+from src.model.CustomTreeModel import CustomTreeModel
+from src.utils.validation import validateAdmin,validateUsers
+
+from src.view.CustomWidgets import customButtton, CustomTabBar, customQMessageBox, UpdateAction, \
+    MergeDialog, FilterAction, CategoryDialog, RunAction, ScanAction, TaskEdit, AddTaskDialog, IssueDialog, \
+    CommentDialog, RTF2PDF, CombinePDF
+from src.view.ListView import  DragDropListView
+from src.view.TreeView import MyTreeView
+
+from src.utils.utils import createTreeModel, getAllChildren
 
 rootPath = os.path.dirname(os.path.abspath(__file__))
+
+pd.set_option("display.max_columns",50)
+pd.set_option("display.width",1000)
+# currentUser = "vjain"
 
 def resource_path(relative_path):
     base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
 
+
+
+
+class UserSelect(QWidget):
+    def __init__(self,parent=None):
+        super(UserSelect, self).__init__(parent=parent)
+
+        self.mainLayout = QVBoxLayout(self)
+        self.label = QLabel("Select User")
+        self.mainLayout.addWidget(self.label)
+        self.userDropDown = QComboBox()
+        self.userDropDown.addItems(['dipeshs','vjain','bikhyats','yogeshb','sachins','guest'])
+        self.mainLayout.addWidget(self.userDropDown)
+        self.okButton = QPushButton('Select')
+
+        self.mainLayout.addWidget(self.okButton,alignment=Qt.AlignCenter)
+        self.cancelButton = QPushButton('Cancel')
+        self.mainLayout.addWidget(self.cancelButton,alignment=Qt.AlignCenter)
+        self.setLayout(self.mainLayout)
+        self.parent().setGeometry(50,50,200,100)
+        self.okButton.clicked.connect(self.okClicked)
+        self.cancelButton.clicked.connect(self.cancelClicked)
+
+    def okClicked(self):
+        self.parent().startApp()
+
+    def cancelClicked(self):
+        self.parent().close()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title = 'Excel tools'
-        self.left = 0
-        self.top = 0
+        self.title = 'Nimble Utilities'
+        self.left = 50
+        self.top = 50
         self.width = 792
         self.height = 610
         self.setWindowTitle(self.title)
-        self.setGeometry(self.left, self.top, self.width, self.height)
-        #
-        self.tabWidget = TabWidget(self)
+        self.userSelect = UserSelect(self)
+        self.setCentralWidget(self.userSelect)
 
-        self.setCentralWidget(self.tabWidget)
         self.show()
+
+    def startApp(self):
+        currentUser = self.userSelect.userDropDown.currentText()
+        self.tabWidget = MainUtility(parent=self,currentUser=currentUser)
+        self.tabWidget.show()
+        self.setCentralWidget(self.tabWidget)
+        # self.setGeometry(self.left, self.top, self.width, self.height)
+        self.setMinimumHeight(550)
+        self.setMinimumWidth(550)
+        self.showMaximized()
 
 
     # Creating tab widgets
 
-class CustomTabBar(QTabBar):
-    def __init__(self,parent=True):
-        super(CustomTabBar, self).__init__(parent=parent)
-        # self.setExpanding(True)
 
-    def tabSizeHint(self, index:int):
-        size = super(CustomTabBar, self).tabSizeHint(index)
-        w = self.parent().width()/2
-        size.setWidth(w)
-        return size
+class MainUtility(QWidget):
+    def __init__(self,parent=None,currentUser=None):
+        super(MainUtility, self).__init__(parent)
+        s.app = self
+        self.adminUsers = []
+        self.projectID = None
+        self.libID = None
+        self.state = 'Items'
+        self.filters = {}
+        self.libraries = []
+        self.currentUser = currentUser
+        self.currentUsername = pd.read_sql_query(f"Select name from users where userId = '{currentUser}'", s.db)['name']
+
+        self.currentUsername = self.currentUsername.values[0] if not self.currentUsername.empty else 'Guest' #TODO: remove after testing
+        self.setupUI()
+        self.disableButton()
+
+        self.projects = pd.read_sql_query(f"SELECT T.ProjectID from team as T inner join project as P on T.ProjectID=P.ProjectID where userID='{self.currentUser}' and T.status='Active' and P.STATUS='Active' ", s.db)
+        self.projectDropDown.addItems(['']+self.projects['ProjectID'].values.tolist())
+        self.projectDropDown.activated.connect(self.projectSelected)
+
+    def disableButton(self,button=None):
+        if button:
+            button.setHidden(True)
+        else:
+            icons = ['edit', 'refresh', 'category','run','scan', 'filter']
+            for i in range(self.iconsLayout.count() - 1):
+                if self.iconsLayout.itemAt(i).widget().objectName() not in icons:
+                    self.iconsLayout.itemAt(i).widget().setHidden(True)
+                else:
+                    self.iconsLayout.itemAt(i).widget().setHidden(False)
+                    self.iconsLayout.itemAt(i).widget().setDisabled(True)
+
+    def flush(self):
+        self.clearTable()
+        for i in range(len(self.libraries)+1):
+            self.libraryDropDown.removeItem(0)
+
+    def clearTable(self):
+        # if self.tableLabel.isHidden():
+        #     self.tableLabel.show()
+        # else:
+        self.tableLabel.hide()
+        # if self.treeView.isHidden():
+        #remove models
+        self.treeView.show()
+        self.detailView.show()
+        # else:
+        #     self.treeView.hide()
+        #     self.detailView.hide()
+
+    def projectSelected(self):
+        # global isAdmin
+        if not self.projectDropDown.currentText():
+            return
+        self.flush()
+
+        self.projectID = self.projectDropDown.currentText()
+
+        if not self.projectID:
+            # self.libraryDropDown.addItems([''])
+            return
+        self.adminUsers = pd.read_sql_query(f"SELECT DISTINCT T.userID FROM project AS P INNER JOIN team_perm AS T ON T.projectid=P.ProjectID WHERE P.ProjectID = '{self.projectID}' AND T.permission = 'Write'",s.db)['userID'].values.tolist()
+        s.isAdmin =  self.currentUser in self.adminUsers
+        # s.isAdmin =  False
+        print(s.isAdmin)
+        s.currentUser = self.currentUser
+        self.projectUsers = pd.read_sql_query(f"SELECT DISTINCT T.userID,U.name FROM project AS P INNER JOIN team_perm AS T INNER JOIN users as U ON T.userID=U.userID AND T.projectid=P.ProjectID WHERE P.ProjectID = '{self.projectID}'",s.db)
+        s.projectUsers = self.projectUsers
+        s.adminUsers = self.adminUsers
+        data = pd.read_sql_query(
+            f"SELECT T.*,D.* from team_perm as T inner join datlib as D on T.PDETAIL=D.LIBID and T.ProjectID = D.PROJECTID where T.userID='{self.currentUser}' and T.PROJECTID = '{self.projectID}'  and T.PRESOURCE='Data Access'",
+            s.db)
+        data = data[data['LTYPE'].isin(['SDTM','SEND','Analysis','Reports'])]
+        data['name_'] = 'Data: ' + data['LLABEL']
+        reports = pd.read_sql_query(
+            f"SELECT T.*,I.* from team_perm AS T  inner join items as I on T.PDETAIL=I.SYSTEMID and T.ProjectID =  I.projectid  where T.userID='{self.currentUser}' AND T.PROJECTID = '{self.projectID}' and T.PRESOURCE='Reports Access'",
+            s.db)
+
+        reports['name_'] = 'Reports: ' + reports['ITEMID']
+        self.libraries = data['name_'].values.tolist() + reports['name_'].values.tolist()
+        self.libraryDropDown.addItems(['']+self.libraries)
+
+        self.libraryDropDown.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.libraryDropDown.adjustSize()
+
+        self.libraryDropDown.activated.connect(lambda x: self.librarySelected(data,reports))
+        return  data,reports
+
+    def librarySelected(self,data,reports):
+        _st = time.time()
+        self.projectID = self.projectDropDown.currentText()
+        self.libName = self.libraryDropDown.currentText()
+        if not self.libName:
+            return
+        self.libType = 'data' if 'Data:' in self.libName else 'report'
+
+        for i in range(self.topButtonLayout.count()):
+            if self.topButtonLayout.itemAt(i).widget() != self.itemsButton:
+                self.topButtonLayout.itemAt(i).widget().setChecked(False)
+            else:
+                self.topButtonLayout.itemAt(i).widget().setChecked(True)
+
+        if self.libType =='data':
+            self.libType = data[data['name_'] == self.libName]['LTYPE'].values[0]
+            self.libID = data[data['name_'] == self.libName]['LIBID'].values[0]
+            self.libName = data[data['name_'] == self.libName]['LLABEL'].values[0]
+            tableData = self.extractObjectSource()
+            tableData['primaryProgPath'] = np.where(tableData["Primary_Progname"],f"//sas-vm/{self.projectID}/Data/{self.libName.split(' ')[0]}/programs/" +\
+                                           tableData["Primary_Progname"] +'.sas',tableData["Primary_Progname"])
+            tableData['primaryLogPath'] = np.where(tableData["Primary_Progname"],f"//sas-vm/{self.projectID}/Data/{self.libName.split(' ')[0]}/programs/" +\
+                                           tableData["Primary_Progname"] +'.log',tableData["Primary_Progname"])
+            tableData['outputPath'] = np.where(tableData["Primary_Progname"], f"//sas-vm/{self.projectID}/Data/{self.libName.split(' ')[0]}/programs/" + \
+                                      tableData["object_name"] + '.sas7bdat',tableData["Primary_Progname"])
+            tableData['qcProgPath'] = np.where(tableData["QC_Progname"], f"//sas-vm/{self.projectID}/Data/{self.libName.split(' ')[0]}/programs/" + \
+                                      tableData["QC_Progname"] + '.sas',tableData["QC_Progname"])
+            tableData['qcLogPath'] = np.where(tableData["QC_Progname"], f"//sas-vm/{self.projectID}/Data/{self.libName.split(' ')[0]}/validation/" + \
+                                     tableData["QC_Progname"] +'.log' ,tableData["QC_Progname"])
+
+
+            self.populateItems(tableData)
+        else:
+            self.libID = reports[reports['name_'] == self.libName]['ITEMID'].values[0]
+            self.libName = reports[reports['name_'] == self.libName]['ITEMID'].values[0]
+            tableModel = self.extractObjectSource()
+            self.detailView.setModel(ListModel([]))
+            self.treeView.setModel(tableModel)
+            self.treeView.showColumn(0)
+            self.treeView.hideColumn(1)
+            self.treeView.hideColumn(2)
+
+            # self.treeView.showColumn(1)
+
+            # tableData = pd.read_sql_query(
+            #     f"SELECT I.projectid,I.COMPLETEID,I.PARENTID,I.ITEMID,I.TEMPLATE,U.* FROM util_obj AS U INNER JOIN items AS  I  ON I.projectid=U.PROJECTID AND I.SYSTEMID=U.objectID WHERE U.PROJECTID='{self.projectID}' and I.COMPLETEID  like '{self.libName}/%' AND U.LIBID = '{self.libName}' ",
+            #     s.db)
+
+            # self.treeView.model().setSource(self.treeView.model()._data.merge(tableData, how = 'right').fillna(''))
+
+        self.treeView.model()._data['Validation_fail'] = self.treeView.model()._data.apply(self.checkValidations,axis=1)
+        self.treeView.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.treeView.selectionModel().selectionChanged.connect(self.populateListView)
+        self.populateIcons()
+        print(time.time()-_st)
+         #data or report
+
+    def populateIcons(self):
+
+        start = time.time()
+        if self.state == 'Items':
+
+            self.edit.setEnabled(True)
+            self.editMenu = QMenu()
+            primaryOwner = QMenu('Primary Owners')
+            self.editMenu.addMenu(primaryOwner)
+            for user in self.adminUsers+['_NA_']:
+                action = UpdateAction(user,'Primary_Owner',parent=self)
+                primaryOwner.addAction(action)
+
+            primaryStatus = QMenu('Primary Status')
+            for s in ['Completed', 'Working', 'Waiting', 'Deferred','_NA_']:
+                action = UpdateAction(s, 'Primary_Status',parent=self)
+                primaryStatus.addAction(action)
+
+            self.editMenu.addMenu(primaryStatus)
+
+            # progNameAction = QAction('Primary Program name')
+            # progNameAction.triggered.connect(lambda : self.treeView.model().updateData(self.treeView.currentIndex(),self.col,EditDialog().exec_(),Qt.EditRole))
+            progNameAction = UpdateAction('Primary Program name','Primary_Progname',editDialog=True,parent=self)
+            self.editMenu.addAction(progNameAction)
+
+            primaryNoteAction = UpdateAction('Primary Notes','Primary_Notes',editDialog=True,parent=self)
+            self.editMenu.addAction(primaryNoteAction)
+
+            qcType = QMenu('QC Type')
+            self.editMenu.addMenu(qcType)
+            # qcTypes = [qcType.addAction(s) for s in ['Full', 'Basic', 'None']]
+
+            for s in ['Full', 'Basic', 'None']:
+                action = UpdateAction(s, 'QC_Type', parent=self)
+                qcType.addAction(action)
+            qcOwnerMenu = QMenu('QC Owner')
+            self.editMenu.addMenu(qcOwnerMenu)
+            # qcOwnerAction = [qcOwnerMenu.addAction(user) for user in self.adminUsers]
+            for user in self.adminUsers+['_NA_']:
+                action = UpdateAction(user, 'QC_Owner', parent=self)
+                qcOwnerMenu.addAction(action)
+
+            qcStatus = QMenu('QC Status')
+            self.editMenu.addMenu(qcStatus)
+            for s in ['Completed', 'Working', 'Waiting', 'Deferred', '_NA_']:
+                action = UpdateAction(s, 'QC_Status', parent=self)
+                qcStatus.addAction(action)
+
+            qcProgAction = UpdateAction('QC Program name','QC_Progname',editDialog=True,parent=self)
+            self.editMenu.addAction(qcProgAction)
+
+            qcNoteAction = UpdateAction('QC Notes','qc_notes',editDialog=True,parent=self)
+            self.editMenu.addAction(qcNoteAction)
+
+
+
+            mergeAction = self.editMenu.addAction('Merge')
+            mergeAction.triggered.connect(self.mergeRows)
+            if self.libType == 'report':
+                mergeAction.setDisabled(True)
+
+            deleteAction = self.editMenu.addAction('Delete outdated item')
+            #TODO: donot allow updates on oudateditems
+            deleteAction.triggered.connect(self.treeView.model().deleteRows)
+
+            self.updateCategories(self.editMenu)
+
+            self.edit.setMenu(self.editMenu)
+
+            self.filterMenu = QMenu()
+            itemName = FilterAction('Name', 'object_name',editDialog=True, parent=self)
+            self.filterMenu.addAction(itemName)
+            primaryOwner = QMenu('Primary Owners')
+
+            primaryOwnerGroup = QActionGroup(self)
+
+            self.filterMenu.addMenu(primaryOwner)
+            for user in self.adminUsers + ['_NA_']:
+                action = FilterAction(user, 'Primary_Owner', parent=self)
+                primaryOwner.addAction(action)
+                primaryOwnerGroup.addAction(action)
+            primaryOwnerGroup.setExclusive(True)
+
+            primaryStatus = QMenu('Primary Status')
+            primaryStatusGroup = QActionGroup(self)
+            for s in ['Completed', 'Working', 'Waiting', 'Deferred', '_NA_']:
+                action = FilterAction(s, 'Primary_Status', parent=self)
+                primaryStatus.addAction(action)
+                primaryStatusGroup.addAction(action)
+            primaryStatusGroup.setExclusive(True)
+            self.filterMenu.addMenu(primaryStatus)
+
+            # progNameAction = QAction('Primary Program name')
+            # progNameAction.triggered.connect(lambda : self.treeView.model().updateData(self.treeView.currentIndex(),self.col,EditDialog().exec_(),Qt.EditRole))
+            progNameAction = FilterAction('Primary Program name', 'Primary_Progname',editDialog=True, parent=self)
+            progNameAction.setCheckable(True)
+            self.filterMenu.addAction(progNameAction)
+
+            primaryNoteAction = FilterAction('Primary Notes', 'Primary_Notes',editDialog=True, parent=self)
+            primaryNoteAction.setCheckable(True)
+            self.filterMenu.addAction(primaryNoteAction)
+            qcType = QMenu('QC Type')
+            self.filterMenu.addMenu(qcType)
+            # qcTypes = [qcType.addAction(s) for s in ['Full', 'Basic', 'None']]
+            qcTypeGroup = QActionGroup(self)
+            for s in ['Full', 'Basic', 'None']:
+                action = UpdateAction(s, 'QC_Type', parent=self)
+                qcType.addAction(action)
+                qcTypeGroup.addAction(action)
+            qcTypeGroup.setExclusive(True)
+
+            qcOwnerMenu = QMenu('QC Owner')
+            qcOwnerGroup = QActionGroup(self)
+
+            self.filterMenu.addMenu(qcOwnerMenu)
+            # qcOwnerAction = [qcOwnerMenu.addAction(user) for user in self.adminUsers]
+            for user in self.adminUsers + ['_NA_']:
+                action = FilterAction(user, 'QC_Owner', parent=self)
+                qcOwnerMenu.addAction(action)
+                qcOwnerGroup.addAction(action)
+            qcOwnerGroup.setExclusive(True)
+
+            qcStatus = QMenu('QC Status')
+            qcStatusGroup = QActionGroup(self)
+            self.filterMenu.addMenu(qcStatus)
+            for s in ['Completed', 'Working', 'Waiting', 'Deferred', '_NA_']:
+                action = FilterAction(s, 'QC_Status', parent=self)
+                qcStatus.addAction(action)
+                qcStatusGroup.addAction(action)
+            qcStatusGroup.setExclusive(True)
+
+            qcProgAction = FilterAction('QC Program name', 'QC_Progname',editDialog=True, parent=self)
+            qcProgAction.setCheckable(True)
+            self.filterMenu.addAction(qcProgAction)
+
+            qcNoteAction = FilterAction('QC Notes', 'qc_notes',editDialog=True, parent=self)
+            qcProgAction.setCheckable(True)
+            self.filterMenu.addAction(qcNoteAction)
+
+            self.actionGroups = [primaryOwnerGroup,primaryStatusGroup,qcTypeGroup,qcOwnerGroup,qcStatusGroup]
+            resetAction = self.filterMenu.addAction('Reset')
+            resetAction.triggered.connect(self.resetData)
+
+            self.runMenu = QMenu()
+            primaryAction = RunAction('Primary',parent=self)
+            self.runMenu.addAction(primaryAction)
+            qcAction = RunAction('QC',parent=self)
+            self.runMenu.addAction(qcAction)
+            self.runBtn.setMenu(self.runMenu)
+            self.runBtn.setEnabled(True)
+
+            self.scanMenu = QMenu()
+            primaryAction = ScanAction('Primary', parent=self)
+            self.scanMenu.addAction(primaryAction)
+            qcAction = ScanAction('QC', parent=self)
+            self.scanMenu.addAction(qcAction)
+            self.scanLogs.setMenu(self.scanMenu)
+            self.scanLogs.setEnabled(True)
+
+            self.tflMenu  = QMenu()
+            rtf2pdf = QAction("RTF to PDF convert",parent=self)
+            rtf2pdf.triggered.connect(self.rtf2pdf)
+            self.tflMenu.addAction(rtf2pdf)
+            combinePDF = QAction("Combibe PDF files",parent=self)
+            combinePDF.triggered.connect(self.combinePDF)
+            self.tflMenu.addAction(combinePDF)
+            self.tfl.setMenu(self.tflMenu)
+
+
+            self.filter.setMenu(self.filterMenu)
+            self.filter.setEnabled(True)
+
+            self.category.setEnabled(True)
+            self.itemsButton.setChecked(True)
+            self.refresh.setEnabled(True)
+
+            self.detailView.setStyleSheet("""                                   
+                                   QListView::item{background-color:rgb(255,255,255)}
+                                   QListView::item:hover{background-color:rgba(229,243,255)}
+                                   QListView::item:selected{background-color:rgba(197,224,247);color:black}
+                               """)
+            icons = ['edit', 'refresh', 'category','run','scan', 'filter','tfl']
+
+            for i in range(self.iconsLayout.count() - 1):
+                if self.iconsLayout.itemAt(i).widget().objectName() not in icons:
+                    self.iconsLayout.itemAt(i).widget().setHidden(True)
+                else:
+                    self.iconsLayout.itemAt(i).widget().setHidden(False)
+            if self.libType == 'report':
+                self.tfl.show()
+                self.tfl.setEnabled(True)
+            else:
+                self.tfl.hide()
+
+        if self.state == 'Tasks':
+            icons = ['add','refresh','remove']
+            for i in range(self.iconsLayout.count()-1):
+                if self.iconsLayout.itemAt(i).widget().objectName() not in icons:
+                    self.iconsLayout.itemAt(i).widget().setHidden(True)
+                else:
+                    self.iconsLayout.itemAt(i).widget().setHidden(False)
+
+
+            self.detailView.setStyleSheet("""
+                                   QListView::item{background-color:rgb(255,255,255)}
+                                   QListView::item:hover{background-color:rgba(229,243,255)}
+                                   QListView::item:selected{background-color:rgba(197,224,247)}
+                               """)
+            try:
+                self.add.clicked.disconnect()
+            except:
+                pass
+            self.add.clicked.connect(self.addTask)
+
+        if self.state == 'Issues':
+            icons = ['add', 'refresh','comment','filter']
+            for i in range(self.iconsLayout.count()-1):
+                if self.iconsLayout.itemAt(i).widget().objectName() not in icons:
+                    self.iconsLayout.itemAt(i).widget().setHidden(True)
+                else:
+                    self.iconsLayout.itemAt(i).widget().setHidden(False)
+            try:
+                self.add.clicked.disconnect()
+            except:
+                pass
+            self.add.setEnabled(True)
+            self.filterMenu = QMenu()
+            ["My open issues",  "Status", "Title", "Detail", "Impacts", "Opened By", "Assigned To","Reset",]
+
+            self.filterMenu.addAction(FilterAction("My open issues","hasComment",custom=True,parent=self))
+            statusMenu = QMenu("Status")
+            statusMenuGroup = QActionGroup(self)
+
+            statusOptions = ['Open','Deferred','Closed']
+            for o in statusOptions:
+                action = FilterAction(o,"issue_Status",parent=self)
+                statusMenu.addAction(action)
+                statusMenuGroup.addAction(action)
+            statusMenuGroup.setExclusive(True)
+
+            self.filterMenu.addMenu(statusMenu)
+            self.filterMenu.addAction(FilterAction("Title","issue_Title",editDialog=True,parent=self))
+            self.filterMenu.addAction(FilterAction("Detail","issue_Detail",editDialog=True,parent=self))
+            self.filterMenu.addAction(FilterAction("Impacts","issue_impact",editDialog=True,parent=self))
+            openedMenu = QMenu("Opened By")
+            openedGroup = QActionGroup(self)
+            assignedMenu = QMenu("Assigned To")
+            assignedGroup = QActionGroup(self)
+            for u in self.projectUsers['userID'].values.tolist():
+                openAction = FilterAction(u,"open_By",parent=self)
+
+                assignAction = FilterAction(u,"assigned_to",parent=self)
+                openedMenu.addAction(openAction)
+                openedGroup.addAction(openAction)
+                assignedMenu.addAction(assignAction)
+                assignedGroup.addAction(assignAction)
+
+            openedGroup.setExclusive(True)
+            assignedGroup.setExclusive(True)
+            self.actionGroups = [openedGroup, assignedGroup, statusMenuGroup]
+            self.filterMenu.addMenu(assignedMenu)
+            self.filterMenu.addMenu(openedMenu)
+            resetAction = self.filterMenu.addAction('Reset')
+            resetAction.triggered.connect(self.resetData)
+            self.filter.setMenu(self.filterMenu)
+            self.add.clicked.connect(self.addIssue)
+            self.detailView.setStyleSheet("""
+                        QListView::item{border-bottom: 1px solid black;}
+                        QListView::item{background-color:rgb(255,255,255)}
+                        QListView::item:hover{background-color:rgba(229,243,255)}
+                        QListView::item:selected{background-color:rgba(197,224,247)}
+                    """)
+        print('Time taken to populate Icons',time.time()-start)
+
+
+    def combinePDF(self):
+
+        dialog = CombinePDF(self)
+        dialog.exec_()
+
+        pass
+
+    def rtf2pdf(self):
+        rows = self.treeView.selectionModel().selectedRows()
+        if len(rows) < 1:
+            msg = customQMessageBox("Please select at least one item.")
+            msg.exec_()
+            return
+
+        dialog = RTF2PDF(self)
+        dialog.exec_()
+
+
+
+
+        # if os.path.exists(path):
+        #     rows = [row.row() for row in rows]
+        #     filenames = self.treeView.model().visibleData.iloc[rows]['Name'].values.tolist()
+
+
+    def addComment(self):
+        if not len(self.treeView.selectionModel().selectedRows()):
+            msg = customQMessageBox("Please select an issue to add comment.")
+            msg.exec_()
+            return
+
+        if self.treeView.model().visibleData.iloc[self.treeView.currentIndex().row()]['Status'].lower() == 'closed':
+            msg = customQMessageBox("Comments on closed issues are not allowed")
+            msg.exec_()
+            return
+
+
+        commentDialog = CommentDialog(self.treeView.currentIndex().row(),parent=self)
+        commentDialog.exec_()
+
+    def addIssue(self):
+        addIssueDialog = IssueDialog(parent=self)
+        addIssueDialog.exec_()
+
+    def editIssue(self,index):
+        rowData = self.treeView.model().visibleData.iloc[index.row()]
+        users = rowData[['Opened By','Assigned To']].values.tolist()
+        @validateUsers(users+self.adminUsers, "You do not have access to this action.")
+        def func():
+            editIssueDialog = IssueDialog(index.row(),self)
+            editIssueDialog.exec_()
+
+        func()
+
+    def populateListView(self):
+        if len(self.treeView.selectionModel().selectedRows()) == 1:
+            if self.state == "Items":
+                row = self.treeView.selectionModel().selectedRows()[0].row()
+                if self.libType == 'report':
+                    objectID = [self.treeView.model().itemFromIndex(row).id for row in
+                                self.treeView.selectionModel().selectedRows()]
+
+                    objectID = self.treeView.model()._data[
+                        self.treeView.model()._data['objectID'].isin(objectID)]['objectID']
+                    if objectID.empty:
+                        self.detailView.setModel(ListModel([]))
+                        return
+                    else:
+
+                        objectID = objectID.values.tolist()[0]
+                else:
+                    objectID = self.treeView.model().visibleData.iloc[row]['objectID']
+
+                validationErrors = self.treeView.model()._data.loc[
+                    self.treeView.model()._data['objectID'] == objectID, 'Validation_fail'].values[0]
+                validationErrors = list(validationErrors.values())
+
+                primaryLog = self.treeView.model()._data.loc[
+                    self.treeView.model()._data['objectID'] == objectID, 'primary_log'].values[0]
+                if primaryLog:
+                    primaryLog = json.loads(primaryLog.decode('ascii').replace('\t','    ').replace('\n',''))
+                else:primaryLog = []
+
+                qcLog = self.treeView.model()._data.loc[
+                    self.treeView.model()._data['objectID'] == objectID, 'qc_log'].values[0]
+
+                if qcLog:
+                    qcLog = json.loads(qcLog.decode('ascii').replace('\t','    ').replace('\n',''))
+                else:qcLog = []
+
+                self.editMenu.actions()[-2].setEnabled(True)
+                listModel = ListModel(validationErrors+primaryLog+qcLog)
+                self.detailView.setModel(listModel)
+            elif self.state == "Tasks":
+                idx =  self.treeView.model().itemFromIndex(self.treeView.selectedIndexes()[0]).id
+                # rowData = self.treeView.model()._data[self.treeView.model()._data['taskid'] == idx]
+
+                items = pd.read_sql_query(f"SELECT * from util_task_items where taskid = '{idx}' and PROJECTID = '{self.projectID}' and LIBID = '{self.libID}' order by tOrder",s.db)
+                listModel = ListModel(items,checkable=True,dataCol='titem_Name',checkVal='titem_Status',parent=self)
+
+                self.detailView.setModel(listModel)
+                try:
+                    self.detailView.clicked.disconnect()
+                except:
+                    pass
+                self.detailView.clicked.connect(self.toggleItemState)
+        else:
+            self.detailView.setModel(ListModel([]))
+
+    def toggleItemState(self,index):
+        if self.treeView.model().itemFromIndex(self.treeView.currentIndex().parent().siblingAtColumn(3)).text() in ['Cancelled','Not Applicable']:
+
+            return
+        row = index.row()
+        state = self.detailView.model()._data.iloc[row]['titem_Status']
+        if state == "X":
+            self.detailView.model().updateDB(index,'Z')
+            #TODO: strike out Text
+
+        elif state == "Z":
+            self.detailView.model().updateDB(index,'')
+        else:
+            self.detailView.model().updateDB(index,'X')
+
+    @validateAdmin
+    def mergeRows(self):
+        if len(self.treeView.selectionModel().selectedRows()) > 1:
+            msg = customQMessageBox('Please select a single row to merge')
+            msg.exec_()
+            return
+
+        row =self.treeView.selectionModel().selectedRows()[0].row()
+        objectID = self.treeView.model().visibleData.iloc[row]['objectID']
+        if self.treeView.model()._data.loc[self.treeView.model()._data['objectID']==objectID,'outDated'].any():
+            mergeDialog = MergeDialog(self)
+            mergeDialog.exec_()
+        else:
+            msg = customQMessageBox('Please select an outdated row to merge')
+            msg.exec_()
+
+    def checkValidations(self,row):
+        validationList  = {}
+        if not row['Primary_Progname']:
+            validationList['l01'] = "Primary Program Name is missing"
+        else:
+            if not re.match(r"^(\w+|-|_)+$",str(row['Primary_Progname'])[:-1]):
+                validationList['l01'] = "Program name is invalid. Valid program can only have letters, numbers, hyphens or underscores and must end with .sas. Retry!"
+
+        if not re.match(r"^v_",str(row['QC_Progname'])):
+            validationList['l06'] = "QC name is invalid. Valid program can only have letters, numbers, hyphens or underscores and must end with .sas. Retry!"
+
+        if not row['QC_Type']:
+            validationList['l02'] = "QC Type is missing"
+
+        if not row['Primary_Owner']:
+            validationList['l03'] = "Primary Owner isn't assigned"
+
+        if row['QC_Type'] in ['Full','Basic'] and not row['QC_Owner']:
+            validationList['l04'] = "QC Owner isn't assigned"
+
+        if row['QC_Type'] in ['Full'] and not row['QC_Progname']:
+            validationList['l05'] = "QC Program name is missing"
+
+        return validationList
+
+    def extractObjectSource(self):
+        # oldDF = pd.read_sql_query('SELECT * from util_obj',s.db)
+        import time
+        if self.libType in ['SDTM','SEND']:
+
+            # FETCH DATA
+            start = time.time()
+            datasets, _ = pyreadstat.read_sas7bdat(
+                f'//sas-vm/{self.projectID}/Data/{self.libType}/meta/datasets.sas7bdat')
+            variables, _ = pyreadstat.read_sas7bdat(
+                f'//sas-vm/{self.projectID}/Data/{self.libType}/meta/variables.sas7bdat')
+
+            print("Time taken to read dataset : ", time.time() - start)
+            start = time.time()
+            datasets = datasets.reset_index()
+            # CREATE NEW COLUMNS FOR DATA DIPLAY
+            datasets['objectID'] = datasets['index'].astype(str)
+            datasets['PROJECTID'] = self.projectID
+            datasets['LIBID'] = self.libID
+            datasets['object_name'] = datasets['DATASET']
+            datasets[['Object_Desc']] = datasets['DESCRIPTION']
+            # supp = [domain for domain in variables['DOMAIN'].unique() if 'SUPP' in variables[variables['DOMAIN']==domain]['ACTION'].unique()]
+            supp = variables[variables['ACTION']=='SUPP']['DOMAIN'].values.tolist() # find  supplemental datasets
+            # CREATE NEW DATASET for display
+            newDF = datasets[['objectID', 'PROJECTID', 'LIBID','object_name', 'Object_Desc']].copy()
+            newDF.loc[datasets['DATASET'].isin(supp), 'Object_Desc'] = [f"Supplemental  for {s}" for s in supp]
+
+             # CHECK FOR NEW DATASETS
+            oldDF = pd.read_sql_query(F"SELECT * from util_obj WHERE PROJECTID='{self.projectID}' and LIBID='{self.libID}'",s.db)
+            # custom_cols = pd.read_sql_query(f"SELECT * from util_custom where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}'",s.db)
+            # custom_cols['Value_List'] = custom_cols['Value_List'].apply(json.loads)
+            # custom_cols = pd.DataFrame(
+            #     [list(row[:-2]) + [x] + list(row[-1:]) for row in custom_cols.values for x in row[-2]],columns=custom_cols.columns)
+            # custom_cols['object_name'] = custom_cols['Value_List']
+            # custom_cols['custom_Columns'] = custom_cols['column_Name']
+            # merged = custom_cols.merge(oldDF, how='outer', on=['PROJECTID', 'LIBID', 'object_name'],suffixes=('','_y'))
+            # oldDF = merged[oldDF.columns].sort_values(['objectID'])
+
+            merged = oldDF.merge(newDF, how='outer', on=['PROJECTID','LIBID','object_name'],suffixes = ('_x',''), indicator=True)
+
+            outdatedData = merged[merged['_merge']=='left_only'] # find outdated Datasets
+            outdatedData = outdatedData['objectID_x'].values.tolist()
+            newDF = merged[merged['_merge']=='right_only']
+            newDF = newDF[['objectID', 'PROJECTID', 'LIBID','object_name', 'Object_Desc']]
+            print("Time taken for processing : ", time.time() - start)
+            st = time.time()
+            newID = pd.read_sql_query(f"SELECT * from util_obj where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}' ",s.db).replace(np.nan,'')
+            print("exec sql",time.time()-st)
+            newID = 0 if newID.empty else newID['objectID'].astype(int).max()+1
+
+            newDF['objectID'] = [i for i in range(newID,newID+newDF.shape[0])]
+
+            start = time.time()
+            # UPDATE DB to add new DATASETS
+            cur = s.cursor
+            for idx,row in newDF.iterrows():
+                print('Updating Database count: ', idx)
+                cur.execute(f"INSERT IGNORE into util_obj (objectID,PROJECTID,LIBID,object_name,Object_Desc) VALUES (%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE  Object_Desc = %s ",
+                            (*row,row['Object_Desc']))
+            print("Time taken to update  database : ", time.time() - start)
+            s.db.commit()
+            ## GET UPDATED info of DATASETS from DB
+            newDF = pd.read_sql_query(f"SELECT * from util_obj where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}' ",s.db).replace(np.nan,'')
+            newDF['outDated'] = False
+            newDF.loc[newDF['objectID'].isin(outdatedData),'outDated'] = True
+            # custom_cols = pd.read_sql_query(
+            #     f"SELECT * from util_custom where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}'", s.db)
+            # custom_cols['Value_List'] = custom_cols['Value_List'].apply(json.loads)
+            # custom_cols = pd.DataFrame(
+            #     [list(row[:-2]) + [x] + list(row[-1:]) for row in custom_cols.values for x in row[-2]],
+            #     columns=custom_cols.columns)
+            # custom_cols['object_name'] = custom_cols['Value_List']
+            # custom_cols['custom_Columns'] = custom_cols['column_Name']
+            # merged = custom_cols.merge(newDF, how='outer', on=['PROJECTID', 'LIBID', 'object_name'],
+            #                            suffixes=('', '_y'))
+            # newDF = merged[oldDF.columns]
+
+            return newDF
+
+        elif self.libType == 'report':
+            pstart = time.time()
+            items = pd.read_sql_query(f"SELECT * from items where projectid = '{self.projectID}'  and PARENTID  like '{self.libName}%'  ",s.db)
+            newDF = items[['SYSTEMID','projectid','ITEMID','DESCRIPTION','items_ORDER']]
+            newDF.loc[:,'objectID'] = newDF['SYSTEMID'].astype(str)
+            newDF.loc[:,'LIBID'] = self.libName
+            newDF.loc[:,'PROJECTID'] = newDF['projectid'].astype(str)
+            newDF.loc[:,'object_name'] = newDF['ITEMID'].astype(str)
+            newDF.loc[:,'Object_Desc'] = newDF['DESCRIPTION'].astype(str)
+            newDF = newDF[['objectID', 'PROJECTID', 'LIBID', 'Object_Desc','object_name']]
+            oldDF = pd.read_sql_query(f"SELECT U.* FROM util_obj AS U WHERE U.PROJECTID='{self.projectID}' and U.LIBID='{self.libName}' ",s.db)
+            merged = oldDF.merge(newDF, how='outer', on=['objectID','PROJECTID','LIBID','object_name'], suffixes=('_x', ''), indicator=True)
+            outdatedData = merged[merged['_merge'] == 'left_only']
+            outdatedData = outdatedData['objectID'].values.tolist()
+            newDF = merged[merged['_merge'] == 'right_only']
+            newDF = newDF[['objectID', 'PROJECTID', 'LIBID', 'object_name','Object_Desc']]
+            print('Time taken to process 1:',time.time()-pstart)
+            # newID = pd.read_sql_query(
+            #     f"SELECT * from util_obj where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}' ", s.db).replace(
+            #     np.nan, '')
+            # newID = 0 if newID.empty else newID['objectID'].astype(int).max() + 1
+            # newDF['objectID'] = [i for i in range(newID, newID + newDF.shape[0])]
+            ustart = time.time()
+            cur = s.db.cursor()
+
+
+            for idx,row in newDF.iterrows():
+                print('Updating Database count: ',idx)
+                cur.execute(
+                    f"INSERT IGNORE into util_obj (objectID,PROJECTID,LIBID,object_name,Object_Desc) VALUES (%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE  Object_Desc = %s ",
+                    (*row, row['Object_Desc']))
+            s.db.commit()
+            utime = time.time()-ustart
+            print("Time taken to update database : ",utime)
+            pstart = time.time()
+            tableData = pd.read_sql_query(f"SELECT I.projectid,I.COMPLETEID,I.PARENTID,I.ITEMID,I.items_ORDER,I.TEMPLATE,U.* FROM util_obj AS U INNER JOIN items AS  I  ON I.projectid=U.PROJECTID AND I.SYSTEMID=U.objectID WHERE U.PROJECTID='{self.projectID}'  and U.LIBID ='{self.libName}'  and I.COMPLETEID  like '{self.libName}/%' ",s.db)
+            tableData['PARENTID'] = tableData['PARENTID'].str.split('/').apply(lambda x:x[-1])
+            tableData = tableData.sort_values('COMPLETEID', key=lambda x: x.str.split('/'))
+            cols = ["Name", "objectID","Description","Category", "Primary Info", "QC Type", "QC Info", "Match", "Pending Issues"]
+            tableData['Description'] = tableData['Object_Desc']
+            tableData["Name"] = tableData['object_name']
+            tableData['Category'] = tableData['custom_Columns'].apply(
+                lambda x: "\n".join([f"{k}:{v}" for k, v in json.loads(x).items()]) if x else '')
+            tableData['Category'] = np.where(tableData['Category'].str.decode('ascii').isna(),
+                                             tableData['Category'],
+                                             tableData['Category'].str.decode('ascii'))
+            tableData.loc[tableData['Primary_Owner'].str.len() > 1, 'Primary_Owner'] += ";"
+            tableData.loc[tableData['Primary_Status'].str.len() > 1, 'Primary_Status'] += "\n"
+            tableData.loc[tableData['Primary_Progname'].str.len() > 1, 'Primary_Progname'] += ";"
+            tableData['Primary_Notes'] = np.where(tableData['Primary_Notes'].str.decode('ascii').isna(),
+                                                   tableData['Primary_Notes'],
+                                                   tableData['Primary_Notes'].str.decode('ascii'))
+            tableData['Primary Info'] = tableData['Primary_Owner'] + tableData['Primary_Status'] + tableData[
+                'Primary_Progname'] + tableData['Primary_Notes']
+            tableData['Primary Info'] = tableData['Primary Info'].str.strip(';').str.strip('\n')
+            tableData['QC Type'] = tableData['QC_Type']
+            tableData.loc[tableData['QC_Owner'].str.len() > 1, 'QC_Owner'] += ";"
+            tableData.loc[tableData['QC_Status'].str.len() > 1, 'QC_Status'] += "\n"
+            tableData.loc[tableData['QC_Progname'].str.len() > 1, 'QC_Progname'] += ";"
+            tableData['qc_notes'] = np.where(tableData['qc_notes'].str.decode('ascii').isna(),
+                                                  tableData['qc_notes'],
+                                                  tableData['qc_notes'].str.decode('ascii'))
+            tableData['QC Info'] = tableData['QC_Owner'] + tableData['QC_Status'] + tableData['QC_Progname'] +tableData['qc_notes']
+            tableData['QC Info'] = tableData['QC Info'].str.strip(';').str.strip('\n')
+            tableData["Match"] = ''
+            tableData["Pending Issues"] = ''
+            tableData = tableData.replace(np.nan, '')
+            tableData['outDated'] = False
+            tableData.loc[tableData['objectID'].isin(outdatedData), 'outDated'] = True
+
+            templateFilter = tableData['TEMPLATE'].isin(['Listing', 'Summary', 'Figure'])
+            props = pd.read_sql_query(
+                f"SELECT P.*, U.*,I.template FROM util_obj AS U INNER JOIN items AS I ON U.PROJECTID=I.projectid  AND I.SYSTEMID=U.objectID INNER JOIN  properties AS P ON U.PROJECTID=P.PROJECTID AND U.objectID=P.SYSTEMID  WHERE U.PROJECTID =  '{self.projectID}' and U.LIBID = '{self.libID}'",
+                s.db)
+            props['SYSTEMID'] = props['SYSTEMID'].astype('str')
+            props['REUSEID'] = props['REUSEID'].astype('str')
+            props = props.set_index('SYSTEMID').loc[
+                tableData[tableData['TEMPLATE'].isin(['Summary', 'Listing', 'Figure'])]['objectID'].values.tolist()].reset_index()
+
+
+            # props = tableData.merge(props, left_on='objectID', right_on='SYSTEMID')
+            tableData.loc[tableData['objectID'].isin(props['SYSTEMID'].values), 'Title'] = props.apply(
+                lambda x: getPropertyValue(props, 'COL2', x.name), axis=1).str.replace(
+                "ITT", '')
+            tableData['Title'] = tableData['Title'].replace(np.nan,'')
+            tableData['Title'] = tableData.apply(lambda x: x['Title'].replace('&itemid', x['ITEMID']), axis=1)
+            ext = props.apply(
+                lambda x: getPropertyValue(props, 'COL12', x.name) if x['template'] == 'Listing' else getPropertyValue(
+                    props, 'COL15', x.name), axis=1)
+
+            extensions = ['.rtf', '.pdf', '.xlsx', '.docx']
+            for k in extensions:
+                ext[ext.str.lower().str.contains(k)] = k
+            tableData.loc[tableData['objectID'].isin(props['SYSTEMID'].values), 'extension'] = ext
+            tableData['outputPath'] = f"//sas-vm/{self.projectID}/Reports/" + tableData.loc[templateFilter,'COMPLETEID'] + tableData['extension']
+            tableData['outputPath'] = tableData['outputPath'].replace(np.nan, '')
+            print('Time taken to process 2 : ', time.time() - pstart)
+
+
+            for folder in tableData['outputPath'].str.split('/').apply(lambda x: "/".join(x[:-1])).replace('',np.nan).dropna().unique():
+                try:
+                     [folder + '/' + item for item in os.listdir(folder)]
+                except:
+                    pass
+            #
+            # tableData = tableData.merge(pd.DataFrame(items, columns=['outputPath']), on='outputPath', how='left',
+            #                           indicator=True)
+            pstart = time.time()
+            exists = tableData['outputPath'].apply(os.path.exists)
+            print('Time taken to check exists ', tableData['outputPath'].shape[0], ' file exists : ', time.time() - pstart)
+            # tableData['lastModified'] = pd.to_datetime(tableData[tableData['_merge']=='both']['outputPath'].apply(os.path.getmtime).apply(time.ctime))
+            pstart = time.time()
+            tableData['lastModified'] = pd.to_datetime(
+                tableData[exists]['outputPath'].apply(os.path.getmtime).apply(time.ctime))
+            print('Time taken to check date ', tableData['outputPath'].shape[0], ' file exists : ',
+                  time.time() - pstart)
+            pstart = time.time()
+            tableData['primaryProgPath'] = f"//sas-vm/{self.projectID}/Reports/{self.libName}/SAS Programs/" + tableData[
+                'ITEMID'] + '.sas'
+            tableData['primaryLogPath'] = f"//sas-vm/{self.projectID}/Reports/{self.libName}/SAS Programs/" + tableData[
+                'ITEMID'] + '.log'
+
+
+            for folder in tableData['primaryLogPath'].str.split('/').apply(lambda x: "/".join(x[:-1])).replace('',
+                                                                                                           np.nan).dropna().unique():
+                try:
+                    [folder + '/' + item for item in os.listdir(folder)]
+                except:
+                    pass
+            # exists = tableData['primaryLogPath'].apply(os.path.exists)
+            tableData['qcProgPath'] = f"//sas-vm/{self.projectID}/Reports/{self.libName}/SAS Validation/" + \
+                                      tableData[
+                                          'ITEMID'] + '.sas'
+            tableData['qcLogPath'] = f"//sas-vm/{self.projectID}/Reports/{self.libName}/SAS Validation/" + tableData[
+                'ITEMID'] + '.log'
+            tableData['qcmatchPath'] = f"//sas-vm/{self.projectID}/Reports/{self.libName}/metadata/qcmatch.txt"
+            print('Time taken to process 3 : ', time.time() - pstart)
+            pstart = time.time()
+            treeModel = CustomTreeModel(tableData, cols, parent=self)
+            treeModel = createTreeModel(treeModel,'objectID','PARENTID',self.libName,'Name','Object_Desc')
+
+            for i,col in enumerate(cols):
+                treeModel.setHeaderData(i,Qt.Horizontal,col)
+            print('Time taken to display : ', time.time() - pstart)
+            return treeModel
+
+
+        elif self.libType == 'Analysis':
+            start = time.time()
+            datasets,_ = pyreadstat.read_sas7bdat(f"//sas-vm/{self.projectID}/Data/{self.libName}/meta/datasets.sas7bdat")
+            print("Time taken to read dataset : ", time.time()-start)
+            start = time.time()
+            datasets['object_name'] = datasets['DATASET']
+            datasets['PROJECTID'] = self.projectID
+            datasets['LIBID'] = self.libID
+            datasets[['Object_Desc']] = datasets['DESCRIPTION']
+            datasets['objectID'] = datasets.index
+            newDF = datasets[['objectID', 'PROJECTID', 'LIBID','object_name', 'Object_Desc']].copy()
+            oldDF = pd.read_sql_query(
+                F"SELECT * from util_obj WHERE PROJECTID='{self.projectID}' and LIBID='{self.libID}'", s.db)
+            merged = oldDF.merge(newDF, how='outer', on=['PROJECTID', 'LIBID', 'object_name'], suffixes=('_x', ''),
+                                 indicator=True)
+            outdatedData = merged[merged['_merge'] == 'left_only']
+            outdatedData = outdatedData['objectID_x'].values.tolist()
+            newDF = merged[merged['_merge'] == 'right_only']
+            newDF = newDF[['objectID', 'PROJECTID', 'LIBID', 'object_name', 'Object_Desc']]
+            newID = pd.read_sql_query(
+                f"SELECT * from util_obj where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}' ", s.db).replace(
+                np.nan, '')
+            newID = 0 if newID.empty else newID['objectID'].astype(int).max() + 1
+            newDF['objectID'] = [i for i in range(newID, newID + newDF.shape[0])]
+            print("Time taken for processing : ", time.time() - start)
+            start = time.time()
+            cur = s.db.cursor()
+            for idx,row in newDF.iterrows():
+
+                cur.execute(
+                    f"INSERT IGNORE into util_obj (objectID,PROJECTID,LIBID,object_name,Object_Desc) VALUES (%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE  Object_Desc = %s ",
+                    (*row, row['Object_Desc']))
+
+            s.db.commit()
+            print("Time taken to update  database : ", time.time() - start)
+            newDF = pd.read_sql_query(
+                f"SELECT * from util_obj where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}' ", s.db).replace(np.nan,'')
+            newDF['outDated'] = False
+            newDF.loc[newDF['objectID'].isin(outdatedData), 'outDated'] = True
+            return  newDF
+
+    def generateReportTree(self,projectID,libName):
+
+        reports = pd.read_sql_query(
+            f"SELECT * from items as I  where I.ProjectID = '{projectID}'  and I.PARENTID = '{libName}'",
+            s.db)
+        parents = [f"{libName}/{folder}" for folder in reports['ITEMID'].values.tolist()]
+        while len(parents):
+            parent  = parents.pop()
+            df = pd.read_sql_query(
+                f"SELECT * from items as I  where I.ProjectID = '{projectID}'  and I.PARENTID = '{parent}'",
+                s.db)
+            df['path'] =   f"{parent}/" + df['ITEMID']
+            df['PARENTID'] = parent.split('/')[-1]
+            reports = reports.append(df)
+
+            parents += df['path'].values.tolist()
+        reports = reports[reports['TEMPLATE'].isin(['Listing','Summary','Figure'])]
+        return  reports
+
+    def populateItems(self,utils_obj):
+        # utils_obj = pd.read_sql_query(f"SELECT * from util_obj where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}' ",s.db)
+        # data = pd.DataFrame(columns=["objectID","Description","Name","Category","Primary Info","QC Type","QC Info","Match","Pending Issues"])
+        start = time.time()
+        utils_obj.fillna('', inplace=True)
+        utils_obj['objectID'] = utils_obj['objectID'].astype(int)
+        utils_obj['Description'] =  utils_obj['Object_Desc']
+        utils_obj["Name"] = utils_obj['object_name']
+        utils_obj['Category'] = utils_obj['custom_Columns'].apply(
+            lambda x: "\n".join([f"{k}:{v}" for k, v in json.loads(x).items()]) if x else '')
+
+        utils_obj['Category'] = np.where(utils_obj['Category'].str.decode('ascii').isna(),
+                                         utils_obj['Category'],
+                                         utils_obj['Category'].str.decode('ascii'))
+        utils_obj.loc[utils_obj['Primary_Owner'].str.len() > 1, 'Primary_Owner'] += ";"
+        utils_obj.loc[utils_obj['Primary_Status'].str.len() > 1, 'Primary_Status']+= "\n"
+        utils_obj.loc[utils_obj['Primary_Progname'].str.len() > 1, 'Primary_Progname']+= ";"
+        utils_obj['Primary_Notes'] = np.where(utils_obj['Primary_Notes'].str.decode('ascii').isna(),
+                                          utils_obj['Primary_Notes'],
+                                          utils_obj['Primary_Notes'].str.decode('ascii'))
+        utils_obj['Primary Info'] = utils_obj['Primary_Owner']+utils_obj['Primary_Status']+utils_obj['Primary_Progname']+utils_obj['Primary_Notes']
+        utils_obj['Primary Info'] = utils_obj['Primary Info'].str.strip(';').str.strip('\n')
+        utils_obj['QC Type'] = utils_obj['QC_Type']
+        utils_obj.loc[utils_obj['QC_Owner'].str.len() > 1, 'QC_Owner']+= ";"
+        utils_obj.loc[utils_obj['QC_Status'].str.len() > 1, 'QC_Status']+= "\n"
+        utils_obj.loc[utils_obj['QC_Progname'].str.len() > 1, 'QC_Progname']+= ";"
+        utils_obj['qc_notes'] = np.where(utils_obj['qc_notes'].str.decode('ascii').isna(),
+                                                 utils_obj['qc_notes'],
+                                                 utils_obj['qc_notes'].str.decode('ascii'))
+        utils_obj['QC Info'] = utils_obj['QC_Owner']+utils_obj['QC_Status']+utils_obj['QC_Progname']+utils_obj['qc_notes']
+        utils_obj['QC Info'] = utils_obj['QC Info'].str.strip(';').str.strip('\n')
+        utils_obj["Match"] = ''
+        utils_obj["Pending Issues"]  = ''
+
+        utils_obj = utils_obj.replace(np.nan,'').sort_values('objectID')
+
+        # pd.read_sql_query(f"SELECT * from util_obj where PROJECTID = '{projectID}' and LIBID = '{libID}' ")
+        tableModel = BaseTableModel(utils_obj,["objectID","Description","Name","Category","Primary Info","QC Type","QC Info","Match","Pending Issues"],parent=self)
+
+        self.treeView.setModel(tableModel)
+        self.treeView.hideColumn(0)
+        self.treeView.hideColumn(1)
+        self.treeView.showColumn(2)
+        print("populateTime :",time.time()-start)
+        return utils_obj
+
+    def setupUI(self):
+        self.mainLayout = QVBoxLayout(self)
+        self.topLayout = QVBoxLayout(self)
+        self.topLayout1 = QHBoxLayout(self)
+        # self.instructionLabel = QLabel('Select Project & Library to get started')
+        # self.topLayout1.addWidget(self.instructionLabel)
+        self.projectLabel = QLabel('Project')
+
+        self.topLayout1.addWidget(self.projectLabel)
+        self.projectDropDown = QComboBox()
+        self.projectDropDown.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.projectDropDown.view().setBaseSize(150, self.projectDropDown.height())
+        # self.projectDropDown.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Minimum)
+        # self.projectDropDown.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLength)
+        self.topLayout1.addWidget(self.projectDropDown)
+
+        self.libraryLabel = QLabel('Library')
+        self.topLayout1.addWidget(self.libraryLabel)
+
+        self.libraryDropDown = QComboBox()
+        view = QListView(self.libraryDropDown)
+        self.libraryDropDown.setView(view)
+        view.setTextElideMode(Qt.ElideNone)
+        # self.libraryDropDown.view().setTextElideMode(Qt.ElideNone)
+        self.libraryDropDown.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # self.libraryDropDown.view().setBaseSize(800,self.libraryDropDown.height())
+        # self.libraryDropDown.setSizePolicy(QSizePolicy.MinimumExpanding,QSizePolicy.Minimum)
+        # self.libraryDropDown.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLength)
+        self.topLayout1.addWidget(self.libraryDropDown)
+
+        self.topLayout1.addStretch()
+
+        self.topButtonLayout = QHBoxLayout(self)
+        self.topButtonLayout.setSpacing(0)
+        self.setContentsMargins(0,0,0,0)
+        styleSheet = """
+            QPushButton{
+                background-color:rgba(150,150,150,50);
+                border:1px solid rgba(150,150,150,90);
+                height:25px;
+                padding:3px;
+            }
+            QPushButton:pressed{
+                background-color:rgba(0,120,215,50);
+                border:1px solid rgba(0,120,215,90);
+
+            }
+            QPushButton:hover{
+                background-color:rgba(0,115,204,50);
+                border:1px solid rgba(0,115,204,90);
+            }
+            QPushButton:checked{
+                background-color:rgba(0,120,215,50);
+                border:1px solid rgba(0,120,215,90);
+            }
+           
+        """
+        self.itemsButton = QPushButton('Items')
+        self.itemsButton.setCheckable(True)
+        self.topButtonLayout.addWidget(self.itemsButton)
+
+        self.itemsButton.setStyleSheet(styleSheet)
+        self.tasksButton = QPushButton('Tasks')
+        self.tasksButton.setCheckable(True)
+        self.topButtonLayout.addWidget(self.tasksButton)
+        self.tasksButton.setStyleSheet(styleSheet)
+        self.issuesButton = QPushButton('Issues')
+        self.issuesButton.setCheckable(True)
+        self.issuesButton.setStyleSheet(styleSheet)
+        self.topButtonLayout.addWidget(self.issuesButton)
+        self.topLayout1.addLayout(self.topButtonLayout)
+
+
+        self.itemsButton.clicked.connect(self.selectState)
+        self.tasksButton.clicked.connect(self.selectState)
+        self.issuesButton.clicked.connect(self.selectState)
+        # self.userLabel =QLabel(f"Current user: {self.currentUsername}")
+        # font  = QFont()
+        # font.setBold(True)
+        # self.userLabel.setFont(font)
+        # self.userLabel.setSizePolicy(QSizePolicy.Minimum,QSizePolicy.Fixed)
+        # self.topLayout.addWidget(self.userLabel,alignment=Qt.AlignRight)
+        self.parent().setWindowTitle(self.parent().windowTitle()+f" : {self.currentUsername}")
+        self.topLayout.addLayout(self.topLayout1)
+        self.iconsWidget = QWidget()
+        self.iconsWidget.setStyleSheet("background-color:#e1e1e1;margin:0px")
+        self.iconsWidget.setContentsMargins(3,0,0,0)
+        # self.iconsWidget
+
+        # self.iconsWidget.setSizePolicy(QSizePolicy.Fixed,QSizePolicy.Fixed)
+        self.iconsWidget.setMinimumHeight(37)
+        self.iconsWidget.setMaximumHeight(37)
+        self.iconsLayout = QHBoxLayout(self)
+        self.iconsLayout.setSpacing(2)
+        self.iconsLayout.setContentsMargins(0,0,0,0)
+        # self.iconsWidget.setStyleSheet()
+        self.iconsWidget.setLayout(self.iconsLayout)
+        self.edit = customButtton(icon=QIcon('icons/edit.png'),name='edit',tooltipText='Edit')
+        self.iconsLayout.addWidget(self.edit,alignment=Qt.AlignLeft)
+        self.refresh = customButtton(icon=QIcon('icons/reset.png'), name='refresh',tooltipText='Refresh', func=self.refreshData)
+        self.iconsLayout.addWidget(self.refresh, alignment=Qt.AlignLeft)
+        self.category = customButtton(icon=QIcon('icons/category.png'), name='category', tooltipText='Category',func=self.categorizeData)
+        self.iconsLayout.addWidget(self.category, alignment=Qt.AlignLeft)
+        self.runBtn = customButtton(icon=QIcon('icons/run.png'),tooltipText='Run', name='run')
+        self.iconsLayout.addWidget(self.runBtn, alignment=Qt.AlignLeft)
+        self.scanLogs = customButtton(icon=QIcon('icons/scan.png'),tooltipText='Scan logs', name='scan')
+
+        self.iconsLayout.addWidget(self.scanLogs, alignment=Qt.AlignLeft)
+
+        self.comment = customButtton(icon=QIcon('icons/comment.png'), tooltipText='Comment', name='comment',func=self.addComment)
+        self.iconsLayout.addWidget(self.comment, alignment=Qt.AlignLeft)
+        self.add = customButtton(icon=QIcon('icons/add.png'), tooltipText='Add', name='add', func=self.addTask)
+        self.iconsLayout.addWidget(self.add, alignment=Qt.AlignLeft)
+        self.filter = customButtton(icon=QIcon('icons/filter.png'), tooltipText='Filter', name='filter',
+                                    func=lambda: print('filter clicke'))
+        self.iconsLayout.addWidget(self.filter, alignment=Qt.AlignLeft)
+        self.remove = customButtton(icon=QIcon('icons/trash.png'), tooltipText='Remove', name='remove',
+                                    func=self.removeTask)
+        self.iconsLayout.addWidget(self.remove, alignment=Qt.AlignLeft)
+        self.tfl = customButtton(icon=QIcon('icons/pdf.png'), tooltipText='TFL tools', name='tfl',
+                                    )
+        self.tfl.hide()
+        self.iconsLayout.addWidget(self.tfl, alignment=Qt.AlignLeft)
+        self.iconsLayout.addStretch()
+
+        self.topLayout.addWidget(self.iconsWidget)
+
+        self.mainLayout.addLayout(self.topLayout)
+        self.tableLabel = QLabel(" <strong>Table here after selecting Items/Tasks/Issues </strong>")
+        self.tableLabel.resize(300, 300)
+        self.mainLayout.addWidget(self.tableLabel,alignment=Qt.AlignCenter)
+
+        self.treeView = MyTreeView()
+        self.treeView.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.treeView.setSelectionBehavior(QAbstractItemView.SelectRows)
+
+        self.treeView.hide()
+        self.splitter = QSplitter(self)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.addWidget(self.treeView)
+        self.detailView =QListView()
+        self.detailView.setResizeMode(QListView.Adjust)
+        self.detailView.setMinimumWidth(200)
+        self.detailView.setMaximumWidth(400)
+        self.detailView.setSizePolicy(QSizePolicy.Minimum,QSizePolicy.MinimumExpanding)
+        self.detailView.setWordWrap(True)
+        self.detailView.setTextElideMode(Qt.ElideNone)
+        self.detailView.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.detailView.hide()
+        self.splitter.addWidget(self.detailView)
+        self.mainLayout.addWidget(self.splitter)
+
+
+
+    def addTask(self):
+
+        addDialog = AddTaskDialog(self)
+        addDialog.exec_()
+        if addDialog.newTaskAdded:
+            self.populateTasks()
+
+
+
+    def selectState(self):
+        btn = self.sender()
+        for i in range(self.topButtonLayout.count()):
+            if self.topButtonLayout.itemAt(i).widget() != btn:
+                self.topButtonLayout.itemAt(i).widget().setChecked(False)
+        self.detailView.setModel(ListModel([]))
+        if btn.text() == 'Items':
+            self.state = 'Items'
+            if self.projectID and self.libID:
+                data = pd.read_sql_query(
+                    f"SELECT T.*,D.* from team_perm as T inner join datlib as D on T.PDETAIL=D.LIBID and T.ProjectID = D.PROJECTID where T.userID='{self.currentUser}' and T.PROJECTID = '{self.projectID}'  and T.PRESOURCE='Data Access'",
+                    s.db)
+                data = data[data['LTYPE'].isin(['SDTM', 'SEND', 'Analysis', 'Reports'])]
+                data['name_'] = 'Data: ' + data['LLABEL']
+                reports = pd.read_sql_query(
+                    f"SELECT T.*,I.* from team_perm AS T  inner join items as I on T.PDETAIL=I.SYSTEMID and T.ProjectID =  I.projectid  where T.userID='{self.currentUser}' AND T.PROJECTID = '{self.projectID}' and T.PRESOURCE='Reports Access'",
+                    s.db)
+
+                reports['name_'] = 'Reports: ' + reports['ITEMID']
+                self.librarySelected(data,reports)
+                try:
+                    self.treeView.doubleClicked.disconnect()
+                except:
+                    pass
+
+
+
+
+        if btn.text() == 'Tasks':
+            self.state = 'Tasks'
+            self.populateTasks()
+
+
+        if btn.text() == 'Issues':
+            self.state = 'Issues'
+            self.populateIssues()
+
+    def removeTask(self):
+        if not self.treeView.currentIndex().isValid():
+            msg = customQMessageBox('Please select a task to remove ')
+            msg.exec_()
+            return
+
+        row = self.treeView.model().itemFromIndex(self.treeView.currentIndex()).id
+        tree = getAllChildren(self.treeView.model()._data, str(row), 'taskid', 'Parentid')
+
+        allChildrenStr = str(tuple(tree.keys())).replace(',)',')')
+        sql = f"update util_task set deletedTask = 'Y' where taskid in {allChildrenStr}"
+        s.cursor.execute(sql)
+        s.db.commit()
+        self.treeView.model().setSource(self.treeView.model()._data[~self.treeView.model()._data['taskid'].isin([int(x) for x in tree.keys()])])
+        treeModel = createTreeModel(self.treeView.model(), 'taskid', 'Parentid', '', 'taskid', 'task_type')
+        self.treeView.setModel(treeModel)
+
+    def populateTasks(self):
+        self.populateIcons()
+        self.clearTable()
+        data = pd.read_sql_query(f"SELECT * FROM util_task WHERE PROJECTID = '{self.projectID}' AND LIBID = '{self.libID}' AND (deletedTask <> 'Y' or deletedTask IS null)",s.db)
+        data['Name'] = data['task_Name']
+        data['Owner'] = data['task_Owner']
+        data['Status'] = data['task_status']
+        data['Planned Start Date'] = pd.to_datetime(data['Planned_Start_Date']).dt.strftime("%b %d,%Y").fillna("yyyy/mm/dd")
+        data['Planned End Date'] = pd.to_datetime(data['Planned_End_Date']).dt.strftime("%b %d,%Y").fillna("yyyy/mm/dd")
+        data['Completion Date'] = pd.to_datetime(data['Completion_Date']).dt.strftime("%b %d,%Y").fillna("yyyy/mm/dd")
+        data['Notes'] = np.where(data['Status_Notes'].str.decode('ascii').isna(),
+                                             data['Status_Notes'],
+                                             data['Status_Notes'].str.decode('ascii'))
+
+        cols =  ['Name','taskid', 'Owner', 'Status', 'Planned Start Date', 'Planned End Date', 'Completion Date',
+                                 'Notes']
+
+        # ignored = data[(data['task_status'].isin(['Cancelled', 'Not Applicable'])&(data['task_type']=='Task'))].index.values.tolist()
+        # completionPer = {}
+
+        #     leaves = [int(k) for k, v in tree.items() if len(tree[k]) == 0]
+        #     tasks = data[(data['taskid'].isin(leaves)) & (~data['task_status'].isin(['Cancelled', 'Not Applicable']))]
+        #     for taskid in tasks['taskid'].values.tolist():
+        # newdata = data.drop(ignored)
+
+        if not data.empty:
+            ignoreMask = ~data['task_status'].isin(['Cancelled', 'Not Applicable'])
+            for i,row in data[(data['task_type']=='Task')&(ignoreMask)].iterrows():
+
+                comp = pd.read_sql_query(f"SELECT x.completed/ y.total as comp from(select count(taskid) as completed from util_task_items where taskid = {row['taskid']} and titem_Status= 'X') x JOIN (SELECT COUNT(taskid) AS total FROM util_task_items WHERE taskid = {row['taskid']} AND (titem_Status <> 'Z' OR titem_Status IS null)) y on 1=1",s.db)
+                comp = comp['comp'][0]  if comp['comp'][0] is not None else 0.
+
+                data.loc[data['taskid']==row['taskid'],'completion'] = comp
+                # taskItems = taskItems[~(taskItems['titem_Status'] == 'Z')]
+                # ncompleted = taskItems[taskItems['titem_Status'] == 'X'].shape[0]
+                # N = taskItems.shape[0]
+                # completionPer = int(ncompleted / N)*100
+                # print(f"{parent} : {completionPer} % completed")
+            # completionPer = {}
+            statusValues = ['','Completed', 'Working', 'Waiting', 'Deferred', 'Cancelled', 'Not Applicable' ]
+            maxlen = len(sorted(statusValues,key=len)[-1])
+
+
+            for parent in data[data['Parentid'] == '']['taskid'].values.tolist():
+                tree = getAllChildren(data[ignoreMask], str(parent), 'taskid', 'Parentid')
+                tree = deque((k,v) for k, v in tree.items())
+                while tree:
+                    k,v = tree.popleft()
+                    # print(k,v)
+                    if len(v) > 0 :
+                        if data[data['taskid'].isin(v)]['completion'].isna().any():
+                            tree.append((k,v))
+                        else:
+                            data.loc[data['taskid']==int(k),'completion'] = data[data['taskid'].isin(v)]['completion'].mean()
+
+            data['completion'] = data['completion'].fillna(0)
+        # data['Status']  = data['task_status'].replace(np.nan,'').str.strip().apply(lambda x :x+" "*(14 - len(x) +1))+ data['completion'].apply(lambda x:f"{x*100:.1f}% completed") # 14 - len of not applicable
+            data['Status']  = data['task_status'].replace(np.nan,'').str.strip().apply(lambda x:x+', ' if len(x) > 0 else x)+ data['completion'].apply(lambda x:f"{x*100:.1f}%") # 14 - len of not applicable
+        data = data.fillna('')
+        treeModel = CustomTreeModel(data,cols)
+        treeModel = createTreeModel(treeModel,'taskid','Parentid','','taskid','task_type')
+        self.detailView.setModel(ListModel([]))
+        for i, col in enumerate(cols):
+            treeModel.setHeaderData(i, Qt.Horizontal, col)
+        self.treeView.setModel(treeModel)
+
+        try:
+            self.treeView.doubleClicked.disconnect()
+        except:
+            pass
+        # self.treeView.clicked.connect(self.expandTask)
+        self.treeView.doubleClicked.connect(self.editTask)
+        self.treeView.setColumnHidden(0,False)
+        self.treeView.hideColumn(1)
+        self.treeView.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.treeView.selectionModel().selectionChanged.connect(self.populateListView)
+        self.treeView.collapseAll()
+
+
+    def expandTask(self,index):
+        if self.treeView.isExpanded(index):
+            self.treeView.collapse(index)
+        else:
+            self.treeView.expand(index)
+
+    def editTask(self,index):
+        row = self.treeView.model().itemFromIndex(index).id
+        rowData = self.treeView.model()._data.loc[self.treeView.model()._data['taskid']==row]
+        milestone = rowData['Parentid'] == ''
+        milestone = milestone.all()
+        # milestone = self.treeView.model().itemFromIndex(self.treeView.currentIndex().siblingAtColumn(0)).hasChildren()
+        owner = rowData['task_Owner'].values[0]
+
+
+        @validateUsers([owner]+[self.currentUser],"Access Error. Only admins and owner have access to this functionality.")
+        def showDialog():
+
+            editDialog = TaskEdit(self,isMilestone=milestone)
+            editDialog.exec_()
+
+        showDialog()
+
+
+
+    def populateIssues(self):
+        self.clearTable()
+        self.populateIcons()
+        data = pd.read_sql_query(f"Select * from util_issues where PROJECTID='{self.projectID}' and LIBID = '{self.libID}'",s.db,parse_dates=['open_date'])
+
+        data['issue_Title'] = data['issue_Title'].apply(lambda x:x.decode('ascii'))
+        data['issue_Detail'] = data['issue_Detail'].apply(lambda x: x.decode('ascii'))
+        data['Title'] = data['issue_Title']
+        data['Detail'] = data['issue_Detail']
+        data['Impacts'] = data['issue_impact']
+        data['Opened By'] = data['open_By']
+        data['Date'] = pd.to_datetime(data['open_date']).dt.strftime('%b %d,%Y')
+        data['Assigned To'] = data['assigned_to']
+        data['Status'] = data['issue_Status']
+        data['hasComment'] = False
+        hasComment = pd.read_sql_query(f"SELECT issueid FROM util_issue_comment WHERE comment_userid = 'dipeshs'", s.db)
+        data.loc[data['issueid'].isin(hasComment['issueid']), 'hasComment'] = True
+        data = data.sort_values(['open_date','issueid'],ascending=False)
+        data = data.replace(np.nan,'')
+
+        model = BaseTableModel(data,cols=['issueid','Title','Detail','Impacts','Opened By','Date','Assigned To','Status'],parent=self)
+        self.treeView.setModel(model)
+
+        # commentsModel = ListModel(['Comment 1 ', 'Comment 2'])
+        # self.detailView.setModel(commentsModel)
+        try:
+            self.treeView.selectionModel().selectionChanged.disconnect()
+            self.treeView.doubleClicked.disconnect()
+        except:
+            pass
+
+        self.treeView.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.treeView.selectionModel().selectionChanged.connect(self.populateComments)
+        self.treeView.doubleClicked.connect(self.editIssue)
+        self.treeView.hideColumn(0)
+        self.treeView.showColumn(1)
+        self.treeView.showColumn(2)
+
+    def populateComments(self):
+        if len(self.treeView.selectedIndexes())>0:
+            row = self.treeView.selectedIndexes()[0].row()
+            issueid = self.treeView.model().visibleData.iloc[row]['issueid']
+            comments =  pd.read_sql_query(f"Select  c.*,u.name from util_issue_comment AS c INNER JOIN users  AS  u ON c.comment_userid=u.userID   where issueid = '{issueid}' and  PROJECTID='{self.projectID}' and LIBID = '{self.libID}' ",s.db)
+            if not comments.empty:
+                commentAttachments = pd.read_sql_query(
+                    "SELECT * from util_comment_attachments where comment_id in " + str(tuple(comments['comment_id'].values.tolist())).replace(',)',')'), s.db)
+
+
+
+            comments['comment_date'] = pd.to_datetime(comments['comment_date']).dt.strftime('%b %d')
+            comments['comment_text']= np.where(comments['comment_text'].str.decode('ascii').isna(),
+                                                      comments['comment_text'],
+                                                      comments['comment_text'].str.decode('ascii'))
+            comments = comments.sort_values(['comment_date','comment_id'],ascending=False)
+            commentsModel = QStandardItemModel(self)
+            # self.detailView.setStyleSheet("background-color:transparent")
+
+            self.detailView.setModel(commentsModel)
+            for i,row in comments.iterrows():
+                # self.detailView.model().row
+                # self.detailView.setIndexWidget(self.detailView.model().index(i),CommentWidget("Vineet Jain","Vineet Jain","Vineet Jain"))
+                # )
+                item = QStandardItem()
+                self.detailView.model().appendRow(item)
+
+                index = self.detailView.model().indexFromItem(item)
+                if not comments.empty:
+                    attachments = commentAttachments[commentAttachments['comment_id'] == row['comment_id']]
+                else:
+                    attachments = pd.DataFrame()
+                widget = CommentWidget(f"{row['name']} ({row['comment_userid']})",row['comment_text'],row['comment_date'],row['comment_id'],item,attachments,parent=self)
+
+                item.setSizeHint(widget.sizeHint())
+                # widget.addItems(['asd','asd'])
+                # widget.resize(QSize(300,300))
+                self.detailView.setIndexWidget(index,widget)
+
+    def refreshData(self):
+        s.db = mysql.connector.connect(host = "192.168.100.15",user="read-utility_user",password="NimUtils1",database="remoteproddb")
+        self.resetData()
+        if self.state == 'Items':
+            data = pd.read_sql_query(
+                f"SELECT T.*,D.* from team_perm as T inner join datlib as D on T.PDETAIL=D.LIBID and T.ProjectID = D.PROJECTID where T.userID='{self.currentUser}' and T.PROJECTID = '{self.projectID}'  and T.PRESOURCE='Data Access'",
+                s.db)
+            data = data[data['LTYPE'].isin(['SDTM', 'SEND', 'Analysis', 'Reports'])]
+            data['name_'] = 'Data: ' + data['LLABEL']
+            reports = pd.read_sql_query(
+                f"SELECT T.*,I.* from team_perm AS T  inner join items as I on T.PDETAIL=I.SYSTEMID and T.ProjectID =  I.projectid  where T.userID='{self.currentUser}' AND T.PROJECTID = '{self.projectID}' and T.PRESOURCE='Reports Access'",
+                s.db)
+
+            reports['name_'] = 'Reports: ' + reports['ITEMID']
+            self.librarySelected(data,reports)
+
+        elif self.state == 'Tasks':
+            self.populateIcons()
+            self.populateTasks()
+
+        elif self.state == 'Issues':
+            self.populateIcons()
+            self.populateIssues()
+
+    @validateAdmin
+    def categorizeData(self):
+        df = pd.read_sql_query(f"SELECT * from util_custom where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}'", s.db)
+        vals = []
+        for cat, values in df[['column_Name', 'Value_List']].values:
+            values = ','.join(json.loads(values))
+            value = f"{cat}: {values}"
+            vals.append(value)
+        vals = '\n'.join(vals)
+
+        category = CategoryDialog(vals)
+        category.exec_()
+
+        if category.valueSaved:
+            categories = category.textBox.toPlainText().split('\n')
+            maxID = pd.read_sql_query("SELECT max(CUSTOMID) as m from util_custom",s.db)['m'].values[0]
+            if not maxID:
+                maxID = 0
+            else:
+                maxID = int(maxID) +1
+            cur = s.db.cursor()
+            cur.execute(f"DELETE from util_custom where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}'")
+            for c in categories:
+                if not c:
+                    return
+                #update util_custom
+                category = c.split(':')[0].strip()
+                values = c.split(':')[1].strip()
+                values = [x.strip() for x in values.split(',')]
+                values = json.dumps(values)
+                cur.execute("INSERT into util_custom(CUSTOMID,PROJECTID,LIBID,column_Name,Value_List) values(%s,%s,%s,%s,%s)",(int(maxID),self.projectID,self.libName  if self.libType == 'report' else self.libID,category,values))
+
+                maxID += 1
+
+            s.db.commit()
+            self.updateCategories(self.editMenu,remove=True)
+            self.removeObsoleteCategories({c.split(':')[0]:[v.strip() for v in c.split(':')[1].strip().split(',')] for c in categories})
+
+    def removeObsoleteCategories(self,categories):
+        self.treeView.model()._data['custom_Columns'] = self.treeView.model()._data['custom_Columns']\
+            .str.decode('ascii')\
+            .fillna(self.treeView.model()._data['custom_Columns'])\
+            .apply(lambda x:json.loads(x) if x else {})\
+            .apply(lambda x: json.dumps({k: v for k, v in x.items() if k in categories.keys() and v in categories[k]}))
+        self.treeView.model()._data['custom_Columns'] = self.treeView.model()._data['custom_Columns'].replace('{}','')
+
+        self.treeView.model()._data['Category'] = self.treeView.model()._data['custom_Columns'].apply( lambda x: "\n".join([f"{k}:{v}" for k, v in json.loads(x).items()]) if x else '')
+        self.treeView.model().updateVisibleData(self.treeView.model()._data)
+        if self.libType == 'report':
+            treeModel = createTreeModel(self.treeView.model(),'objectID','PARENTID', self.libName,'Name',
+                            'Object_Desc')
+            self.treeView.setModel(treeModel)
+        cur = s.db.cursor()
+        for objectId, custom_Columns in self.treeView.model()._data[['objectID', 'custom_Columns']].values:
+            cur.execute(
+                f"UPDATE util_obj set custom_Columns = '{custom_Columns}' where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}' and objectID='{objectId}'")
+
+        s.db.commit()
+
+    def updateCategories(self,menu,remove=False,filter=False):
+        custom_cols = pd.read_sql_query(
+            f"SELECT * from util_custom where PROJECTID = '{self.projectID}' and LIBID = '{self.libID}'", s.db)
+        custom_cols['Value_List'] = custom_cols['Value_List'].apply(json.loads)
+
+
+        if remove:
+            for action in menu.actions()[9:-2]:
+
+                    menu.removeAction(action)
+
+        for category, values in custom_cols[['column_Name', 'Value_List']].values:
+            categoryMenu = QMenu(category,parent=self)
+
+            for action in values :
+                if filter:
+                    action = FilterAction(action, f'{category}|custom_Columns', custom=True, parent=self)
+                    categoryMenu.addAction(action)
+                else:
+                    action = UpdateAction(action,f'{category}|custom_Columns',custom=True,parent=self)
+                    categoryMenu.addAction(action)
+
+
+            menu.insertMenu(menu.actions()[-2],categoryMenu)
+
+    def resetData(self):
+        self.filters = {}
+
+        self.treeView.model().updateFilteredData(self.treeView.model()._data)
+        if self.libType == 'report':
+            treeModel = createTreeModel( self.treeView.model(), 'objectID','PARENTID', self.libName,'Name',
+                            'Object_Desc')
+            self.treeView.setModel(treeModel)
+        for group in self.actionGroups:
+            for action in group.actions():
+                action.setChecked(False)
+        for action in self.filterMenu.actions():
+            action.setChecked(False)
 
 class TabWidget(QWidget):
-    def __init__(self, parent):
+    def __init__(self, parent,currentUser):
         super(TabWidget, self).__init__(parent)
+        self.currentUser = currentUser
         self.setupUi()
 
     def resizeEvent(self, event):
@@ -56,6 +1545,7 @@ class TabWidget(QWidget):
         size = self.tabs.tabBar().size()
         size.setWidth(self.size().width())
         self.tabs.tabBar().resize(size)
+
         # self.tabs.tabBar().resizeEvent(event)
         # self.tabs.tabBar().setUsesScrollButtons(False)
         # print('sdsd')
@@ -72,42 +1562,14 @@ class TabWidget(QWidget):
         self.tabs.setTabBar(self.tabBar)
         # Add tabs
         self.tabs.addTab(self.tab1, "Project-Library Tracking")
-        self.tabs.addTab(self.tab2, "Misc. Utilities")
+        # self.tabs.addTab(self.tab2, "Misc. Utilities")
 
         # Create first tab
         self.tab1Layout = QVBoxLayout(self)
-        # self.excelWidget = ExcelCompare()
-        self.topLayout = QHBoxLayout(self)
-        self.instructionLabel = QLabel('Select Project & Library to get started')
-        self.topLayout.addWidget(self.instructionLabel)
-        self.projectDropDown = QComboBox()
-        self.projectDropDown.addItems(['Project 1','Project 2','Project 3'])
-        self.topLayout.addWidget(self.projectDropDown)
-        self.projectLabel = QLabel('Project')
-        self.topLayout.addWidget(self.projectLabel)
-        self.libraryDropDown = QComboBox()
-        self.libraryDropDown.addItems(['library 1', 'library 2', 'library 3'])
-        self.topLayout.addWidget(self.libraryDropDown)
-        self.libraryLabel = QLabel('Library')
-        self.topLayout.addWidget(self.libraryLabel)
-        self.topLayout.addStretch()
-
-        self.topButtonLayout = QHBoxLayout(self)
-        self.itemsButton = QPushButton('Items')
-        self.topButtonLayout.addWidget(self.itemsButton)
-        self.tasksButton = QPushButton('Tasks')
-        self.topButtonLayout.addWidget(self.tasksButton)
-        self.issuesButton = QPushButton('Issues')
-        self.topButtonLayout.addWidget(self.issuesButton)
-        self.topLayout.addLayout(self.topButtonLayout)
-
-        self.itemsButton.clicked.connect(self.buttonClicked)
-
-        self.tab1Layout.addLayout(self.topLayout)
-        self.tableView = QTableView()
-        self.tableView.resize(300,300)
-        self.tab1Layout.addWidget(self.tableView)
-
+        self.tab1Layout.setSpacing(0)
+        self.tab1Layout.setContentsMargins(0,0,0,0)
+        self.mainUtility = MainUtility(parent=self,currentUser=self.currentUser)
+        self.tab1Layout.addWidget(self.mainUtility)
         self.tab1.setLayout(self.tab1Layout)
 
         # Create second tab
@@ -141,9 +1603,6 @@ class TabWidget(QWidget):
         self.layout.addWidget(self.tabs)
         self.setLayout(self.layout)
 
-    def buttonClicked(self):
-        print('here')
-
     def stepSelected(self):
         if len(self.utilityListView.selectedIndexes()) < 1: return
         step = self.listModel.itemData(self.utilityListView.selectedIndexes()[0])[0]
@@ -154,115 +1613,6 @@ class TabWidget(QWidget):
         if step == 'Excel Compare':
             self.excelComapre =  ExcelCompare(self)
             self.rightlayout.addWidget(self.excelComapre)
-
-class ListModel(QAbstractListModel):
-    def __init__(self,data=[]):
-        super(ListModel, self).__init__()
-        self._data = data
-
-    def flags(self, index):
-        defaultFalgs = super(ListModel, self).flags(index)
-        if index.isValid():
-            return Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled | defaultFalgs
-        else:
-            return  Qt.ItemIsDropEnabled | defaultFalgs
-
-    def data(self, index, role:Qt.DisplayRole):
-        if role == Qt.DisplayRole:
-            return str(self._data[index.row()])
-
-    def rowCount(self, parent):
-        return  len(self._data)
-
-
-class DragDropListView(QListView):
-    def __init__(self,parent=None):
-        super(DragDropListView, self).__init__(parent)
-
-        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.setDragEnabled(True)
-        self.setAcceptDrops(True)
-        self.showDropIndicator()
-        self.setDropIndicatorShown(True)
-        self.setDragDropMode(QAbstractItemView.DragDrop)
-
-    def dragEnterEvent(self, event):
-        if self.objectName() == 'excludedListView' or self.objectName() == 'includedListView' :
-            if event.source().objectName()=='excludedListView' or event.source().objectName()=='includedListView':
-                event.setAccepted(True)
-                return
-
-        if self.objectName() == 'keysListView' or self.objectName() == 'varListView':
-            if event.source().objectName()=='keysListView' or event.source().objectName()=='varListView':
-                event.setAccepted(True)
-                return
-
-    def dragMoveEvent(self, e):
-        super(DragDropListView, self).dragMoveEvent(e)
-        e.setAccepted(True)
-
-    def dropEvent(self, event):
-        index = self.indexAt(event.pos())
-        source = event.source()
-        sourceId = event.source().selectedIndexes()[0]
-        if not sourceId.isValid():
-            return
-
-        tempVal = source.model()._data[sourceId.row()]
-        if self==source:
-            self.model().beginRemoveRows(QModelIndex(), index.row(), index.row())
-            del self.model()._data[sourceId.row()]
-            self.model().endRemoveRows()
-        else:
-            source.model().beginRemoveRows(QModelIndex(), index.row(), index.row())
-            del source.model()._data[sourceId.row()]
-            source.model().endRemoveRows()
-
-        if self.dropIndicatorPosition() == QAbstractItemView.BelowItem:
-            destIndex = index.row() + 1
-        else:
-            destIndex = index.row()
-
-        self.model().beginInsertRows(QModelIndex(),destIndex,destIndex)
-
-        if self.dropIndicatorPosition() == QAbstractItemView.OnViewport:
-            self.model()._data.append(tempVal)
-        else:
-            self.model()._data.insert(destIndex,tempVal)
-        self.model().endInsertRows()
-
-        if self.objectName() == 'keysListView' or source.objectName() == 'keysListView':
-            if len(self.parent().includedListView.selectedIndexes())>0:
-                sheetName = self.parent().includedListView.selectedIndexes()[0].data()
-                self.parent().keys[sheetName] = self.parent().keysListView.model()._data
-        if self!=source and self.objectName() == 'includedListView':
-            self.parent().keys[tempVal] = []
-        if self!=source and source.objectName() == 'includedListView':
-            del self.parent().keys[tempVal]
-        self.clearSelection()
-
-
-class customQMessageBox(QDialog):
-    def __init__(self):
-        super().__init__()
-        self.resize(250, 120)
-        self.layout = QVBoxLayout()
-        self.text = QLabel()
-        self.text.setText("Message")
-        self.text.setWordWrap(True)
-        self.layout.addWidget(self.text,alignment=Qt.AlignCenter)
-        self.button = QPushButton('OK')
-        self.button.clicked.connect(self.okOptions)
-        self.layout.addWidget(self.button,alignment=Qt.AlignCenter)
-        self.setLayout(self.layout)
-        self.setWindowTitle("Warning")
-
-    def okOptions(self):
-        self.optionsOK = True
-        self.close()
-
-    def setText(self,text):
-        self.text.setText(text)
 
 
 class ExcelCompare(QWidget):
@@ -1187,8 +2537,20 @@ def main ():
                       "QPushButton#browseButton:pressed {background-color: grey;border:none}")
 
     window = MainWindow()
+
     window.show()
     sys.exit(app.exec_())
+
+def getPropertyValue(props,col,row):
+    if   props.loc[row,col] is None:
+        return  ''
+    reuse = props.loc[row,col].split(':')
+    if reuse[1] == 'true':
+        reuseRow = props.loc[row,'REUSEID']
+        row = props[props['SYSTEMID'] ==reuseRow].index[0]
+        return getPropertyValue(props, col, row)
+    else:
+        return ":".join(reuse[2:])
 
 if __name__ == '__main__':
     main()
