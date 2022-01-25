@@ -3,8 +3,9 @@ import os
 import subprocess
 import pandas as pd
 from PySide2.QtCore import Qt, QSize
-from PySide2.QtGui import QFont, QPainter, QIcon, QCursor
-from PySide2.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy, QStyleOption, QStyle, QPushButton
+from PySide2.QtGui import QFont, QPainter, QIcon, QCursor, QColor, QBrush
+from PySide2.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy, QStyleOption, QStyle, QPushButton, \
+    QItemDelegate, QGridLayout, QStyledItemDelegate
 import src.settings as s
 from src.utils.utils import temp_file
          # subprocess.Popen(f'explorer {filename}')
@@ -26,8 +27,11 @@ class AttachmentButton(QPushButton):
 
         self.parent().setDisabled(True)
         with temp_file('wb',self.file,suffix='.'+self.name.split('.')[-1]) as filename:
-
-            os.system(filename)
+            # os.system(f"cmd /c {filename}")
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE # default
+            subprocess.run(f'cmd /c {filename}',startupinfo=si)
         self.parent().setEnabled(True)
 
 
@@ -79,8 +83,9 @@ class CommentWidget(QWidget):
 
     def mouseDoubleClickEvent(self, event):
         from src.view.customDialogs import customQMessageBox
-        s.cursor.execute(f'SELECT comment_userid from util_issue_comment where comment_id = {self.commentId}')
-        commentUserId = s.cursor.fetchone()[0]
+        cursor = s.db.cursor()
+        cursor.execute(f'SELECT comment_userid from util_issue_comment where comment_id = {self.commentId}')
+        commentUserId = cursor.fetchone()[0]
         if s.currentUser != commentUserId:
 
             msg = customQMessageBox("You cannot edit this comment because you are not the author of this comment.")
@@ -111,6 +116,7 @@ class CommentWidget(QWidget):
         self.attachmentBtn.setIconSize(QSize(32,32))
         self.attachmentBtn.setFixedSize(QSize(15,15))
         self.topLayout.addWidget(self.attachmentBtn,alignment=Qt.AlignLeft) # with user id
+        self.topLayout.addStretch()
 
         self.topLayout.addWidget(self.date,alignment=Qt.AlignRight)
         self.commentLayout.addLayout(self.topLayout)
@@ -134,7 +140,48 @@ class CommentWidget(QWidget):
         self.commentLayout.addStretch()
         # self.attachmentWidget.setSizePolicy(QSizePolicy.Minimum,QSizePolicy.Minimum)
         self.setSizePolicy(QSizePolicy.Minimum,QSizePolicy.Minimum)
-#
+
+class InfoWidget(QLabel):
+
+    def __init__(self,data,parent=None):
+        super(InfoWidget, self).__init__(parent=parent)
+        ownerLabel = data['owner']+";" if data['owner'] else data['owner']
+        statusLabel = data['status']
+        progLabel = data['program']+";" if data['program'] else data['program']
+        noteLabel = data['note']
+        label = f"<span style='font-size:14px;color:#27ae60'>{ownerLabel}</span><span style='font-size:14px;color:#8e44ad'>{statusLabel}</span><br><span style='font-size:14px;color:#e67e22'>{progLabel}</span><span style='font-size:14px;color:#f1c40f'>{noteLabel}</span>"
+        self.setWordWrap(True)
+        self.setText(label)
+
+    def updateLabel(self,data):
+        ownerLabel = data['owner'] + ";" if data['owner'] else data['owner']
+        statusLabel = data['status']
+        progLabel = data['program'] + ";" if data['program'] else data['program']
+        noteLabel = data['note']
+        label = f"<span style='font-size:14px;color:#27ae60'>{ownerLabel}</span><span style='font-size:14px;color:#8e44ad'>{statusLabel}</span><br><span style='font-size:14px;color:#e67e22'>{progLabel}</span><span style='font-size:14px;color:#f1c40f'>{noteLabel}</span>"
+        self.setText(label)
+
+class PrimaryInfoDelegate(QStyledItemDelegate):
+    def __init__(self,parent=None):
+        super(PrimaryInfoDelegate, self).__init__(parent)
+        self.widget = None
+
+    def initStyleOption(self, option, index):
+        super(PrimaryInfoDelegate, self).initStyleOption(option,index)
+        if option.state & QStyle.State_MouseOver:
+            option.backgroundBrush = QBrush(QColor(229,243,255,0))
+        elif option.state & QStyle.State_Selected:
+            option.backgroundBrush = QBrush(QColor(197,224,247,0))
 
 
+    def createEditor(self, parent, option, index):
+        objectID = index.model().visibleData['objectID'].iloc[index.row()]
+        row = index.model()._data.query(f'objectID=={objectID}').iloc[0]
+        self.widget = InfoWidget(row['Primary_Info'],parent)
+        return self.widget
+
+    def setEditorData(self, editor, index):
+        objectID = index.model().visibleData['objectID'].iloc[index.row()]
+        row = index.model()._data.query(f'objectID=={objectID}').iloc[0]
+        editor.updateLabel(row['Primary_Info'])
 

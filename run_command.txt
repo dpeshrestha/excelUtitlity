@@ -1,0 +1,1 @@
+"C:\Program Files\SASHome\SASFoundation\9.4\sas.exe" nosplash -sysIn "\\sas-vm\DEV2021\Data\ADAM\programs\ADAE.sas" -log "\\sas-vm\DEV2021\Data\ADAM\programs\ADAE.log" -print "\\sas-vm\DEV2021\Data\ADAM\programs\ADAE.lst"

@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+*.sas7bdat
+*.csv
+
 # C extensions
 *.so
 

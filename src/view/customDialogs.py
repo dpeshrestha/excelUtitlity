@@ -4,7 +4,8 @@ import src.settings as s
 
 class customQMessageBox(QDialog):
     def __init__(self,text=''):
-        super().__init__(parent=s.app,f=Qt.WindowSystemMenuHint|Qt.WindowTitleHint)
+        super().__init__(parent=s.app)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.resize(250, 120)
         self.layout = QVBoxLayout()
         self.text = QLabel()

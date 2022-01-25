@@ -3,8 +3,9 @@ block_cipher = None
 
 
 a = Analysis(['src\\main.py'],
-             pathex=['C:\\Users\\acer\\PycharmProjects\\pythonProject'],
-             binaries=[('C:\\Users\\acer\\PycharmProjects\\pythonProject\\icons','icons'),],
+             pathex=['C:\\Users\\dipeshs\\PycharmProjects\\excelUtitlity'],
+             binaries=[('C:\\Users\\dipeshs\\PycharmProjects\\excelUtitlity\\icons','icons'),
+             ('C:\\Users\\dipeshs\\PycharmProjects\\excelUtitlity\\validations','validations')],
              datas=[],
              hiddenimports=['pyreadstat._readstat_writer',
              'pyreadstat.worker',],
@@ -21,12 +22,12 @@ exe = EXE(pyz,
           a.scripts,
           [],
           exclude_binaries=True,
-          name='main',
+          name='Utility',
           debug=False,
           bootloader_ignore_signals=False,
           strip=False,
           upx=True,
-          console=False )
+          console=True )
 coll = COLLECT(exe,
                a.binaries,
                a.zipfiles,
